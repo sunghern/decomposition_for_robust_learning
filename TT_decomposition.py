@@ -21,15 +21,20 @@ import pytest
 import argparse
 import math
 import random
+import time
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.models as torchmodel
 import numpy as np
-from loguru import logger
+#from loguru import logger
 from numpy.linalg import inv
 from numpy.linalg import norm
 from joblib import Parallel, delayed
 from multiprocessing import Process, Manager, cpu_count, Pool
 from torch.autograd import Variable
+from torch.utils.data import Dataset
+from torchvision import datasets
+from torchvision.transforms import ToTensor
 
 parser = argparse.ArgumentParser(description='Decomposition for Robust Learning')
 parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18')
@@ -482,6 +487,14 @@ class ADMM:
 
 """"""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""""
 
+class CrossEntropyLossSoft(torch.nn.modules.loss._Loss):
+    def forward(self, output, target):
+        output_log_prob = torch.nn.functional.log_softmax(output, dim=1)
+        target = target.unsqueeze(1)
+        output_log_prob = output_log_prob.unsqueeze(2)
+        cross_entropy_loss = -torch.bmm(target, output_log_prob)
+        return cross_entropy_loss
+
 class AverageMeter(object):
   def __init__(self, name, fmt=':f'):
     self.name = name
@@ -547,6 +560,105 @@ def set_random_seed(seed=None):
   torch.cuda.manual_seed(seed)
   torch.cuda.manual_seed_all(seed)
 
+  def train(train_loader, model, criterion, soft_criterion, optimizer, epoch, args):
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(train_loader),
+        [batch_time, data_time, losses, top1, top5],
+        prefix="Epoch: [{}]".format(epoch))
+
+    # switch to train mode
+    model.train()
+
+    for i, (images, target) in enumerate(train_loader):
+        if args.lr_scheduler == 'cosine':
+            nBatch = len(train_loader)
+            if epoch < args.warmup_epochs:
+                cosine_warmup_adjust_learning_rate(
+                    args, optimizer, args.warmup_epochs * nBatch,
+                    nBatch, epoch, i, args.warmup_lr)
+            else:
+                cosine_adjust_learning_rate(
+                    args, optimizer, epoch - args.warmup_epochs, i, nBatch)
+
+        if use_cuda:
+            images, target = images.cuda(args.gpu), target.cuda(args.gpu)
+        
+        if args.dataset == 'cifar10':
+            num_classes = 10
+        elif args.dataset == 'cifar100':
+            num_classes = 100
+        elif args.dataset == 'imagenet':
+            num_classes = 1000   
+
+        if args.gpu is not None:
+            images = images.cuda(args.gpu, non_blocking=True)
+        if torch.cuda.is_available():
+            target = target.cuda(args.gpu, non_blocking=True)
+
+        optimizer.zero_grad()
+
+        output = model(images)
+        loss = criterion(output, target)
+
+        # measure accuracy and record loss
+        acc1, acc5 = accuracy(output, target, topk=(1, 5))
+        losses.update(loss.item(), images.size(0))
+        top1.update(acc1[0], images.size(0))
+        top5.update(acc5[0], images.size(0))
+        loss.backward()
+
+        # compute gradient and do SGD step
+        optimizer.step()
+
+        if i % args.print_freq == 0:
+            progress.display(i)
+            #wandb.log({"training_accuracy": round(top1.avg.item(), 4)})
+
+def validate(val_loader, model, criterion, args, epoch):
+    #wandb.init(project="validate-test-project", entity="sunghern")
+    batch_time = AverageMeter('Time', ':6.3f')
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    progress = ProgressMeter(
+        len(val_loader),
+        [batch_time, losses, top1, top5],
+        prefix='Test: ')
+
+    # switch to evaluate mode
+    model.eval()
+
+    with torch.no_grad():
+        count = 0
+        for i, (images, target) in enumerate(val_loader):
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            if torch.cuda.is_available():
+                target = target.cuda(args.gpu, non_blocking=True)
+
+            output = model(images)
+            loss = criterion(output, target)
+
+            # measure accuracy and record loss
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+
+            if i % args.print_freq == 0:
+                progress.display(i)
+           
+        # TODO: this should also be done with the ProgressMeter
+        print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
+              .format(top1=top1, top5=top5))
+
+    return top1.avg
+
 def main():
   args = parser.parser_args()
   print(args.checkpath)
@@ -567,15 +679,26 @@ def main():
   elif args.dataset == 'imagenet':
     num_classes = 1000
   
-  model = models.__dict__[args.arch](num_classes=num_classes)
-  model = model.cuda('cuad:{}'.format(args.gpu))
+  #model = models.__dict__[args.arch](num_classes=num_classes)
+  model = torchmodel.resnet18()
+  model = model.cuda('cuda:{}'.format(args.gpu))
 
   if args.checkpoint is not None:
     checkpoint = torch.load(args.checkpoint)
     model.load_state_dict(checkpoint)
 
   # data load
-  # train_loader, val_loader = data_loader()
+  #train_loader, val_loader = data_loader('/data', 
+  #dataset=args.dataset, batch_size=args.batch_size, 
+  #workers=args.workers)
+
+  train_loader = datasets.CIFAR10(root='./data', train=True, download=True, transform=transformer)
+  val_loader = datasets.CIFAR10(root='./data', train=False, download=True, transform=transformer)
+
+  optimizer = torch.optim.Adam(model.parameters(), lr = args.lr,
+                                weight_decay=args.weight_decay)
+  #optimizer = torch.optim.SGD(model.parameters(), lr=args.lr,
+                              #momentum=args.momentum, weight_decay=args.weight_decay, nesterov=True)
 
   criterion = torch.nn.CrossEntropyLoss()
   soft_criterion = CrossEntropyLossSoft(reduction="mean")
@@ -583,10 +706,12 @@ def main():
   # evaluate
   if args.evaluate:
     print('evaluation')
+    validate(val_loader, model, criterion, args, args.epochs)
+       
+    return  
 
   for epoch in range(args.epochs):
-    train(train_loader, model, criterion, soft_criterion, optimizer, epoch
-          args)
+    train(train_loader, model, criterion, soft_criterion, optimizer, epoch, args)
 
     acc1 = validate(val_loader, model, criterion, args, epoch)
 
